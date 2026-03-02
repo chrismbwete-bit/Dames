@@ -336,24 +336,6 @@ export const PlayerService = {
 //  MATCH OPERATIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export interface MatchData {
-  id: string;
-  player1Id: string;
-  player2Id: string | null;
-  mode: 'ai' | 'online' | 'challenge';
-  status: 'pending' | 'active' | 'finished' | 'cancelled';
-  winnerId: string | null;
-  betAmount: number;
-  currency: 'CDF' | 'USD';
-  boardSize: number;
-  pieceCount: number;
-  timePerTurn: number;
-  consecutiveDraws: number;
-  boardState: string;
-  createdAt: string;
-  finishedAt: string | null;
-}
-
 export const MatchService = {
 
   async create(data: Omit<MatchData, 'id' | 'createdAt'>): Promise<MatchData | null> {
@@ -392,14 +374,19 @@ export const MatchService = {
   async update(id: string, updates: Partial<MatchData>): Promise<void> {
     const matches = ls<MatchData[]>(LS.matches, []);
     const idx = matches.findIndex(m => m.id === id);
-    if (idx >= 0) { matches[idx] = { ...matches[idx], ...updates }; lsSet(LS.matches, matches); }
+
+    if (idx >= 0) {
+      matches[idx] = { ...matches[idx], ...updates };
+      lsSet(LS.matches, matches);
+    }
 
     const dbUpdates: Record<string, unknown> = {};
-    if (updates.status !== undefined)          dbUpdates.status = updates.status;
-    if (updates.winnerId !== undefined)        dbUpdates.winner_id = updates.winnerId;
+
+    if (updates.status !== undefined)           dbUpdates.status = updates.status;
+    if (updates.winnerId !== undefined)         dbUpdates.winner_id = updates.winnerId;
     if (updates.consecutiveDraws !== undefined) dbUpdates.consecutive_draws = updates.consecutiveDraws;
-    if (updates.boardState !== undefined)      dbUpdates.board_state = updates.boardState;
-    if (updates.finishedAt !== undefined)      dbUpdates.finished_at = updates.finishedAt;
+    if (updates.boardState !== undefined)       dbUpdates.board_state = updates.boardState;
+    if (updates.finishedAt !== undefined)       dbUpdates.finished_at = updates.finishedAt;
 
     if (Object.keys(dbUpdates).length > 0) {
       await safeUpdate('matches', dbUpdates, { id });
@@ -407,7 +394,6 @@ export const MatchService = {
   },
 
   async deleteFinished(matchId: string): Promise<void> {
-    // Supprimer localement
     let matches = ls<MatchData[]>(LS.matches, []);
     matches = matches.filter(m => m.id !== matchId);
     lsSet(LS.matches, matches);
@@ -416,35 +402,74 @@ export const MatchService = {
     chats = chats.filter(c => c.matchId !== matchId);
     lsSet(LS.chat, chats);
 
-    // Supprimer de Supabase
     await safeDelete('matches', { id: matchId });
     await safeDelete('chat_messages', { match_id: matchId });
   },
 
   async cleanAIMatches(): Promise<void> {
-    // Supprimer tous les matchs IA du localStorage (ne devraient pas exister)
     let matches = ls<MatchData[]>(LS.matches, []);
     const aiMatchIds = matches.filter(m => m.mode === 'ai').map(m => m.id);
+
     if (aiMatchIds.length > 0) {
       matches = matches.filter(m => m.mode !== 'ai');
       lsSet(LS.matches, matches);
+
       let chats = ls<ChatMessageData[]>(LS.chat, []);
       chats = chats.filter(c => !aiMatchIds.includes(c.matchId));
       lsSet(LS.chat, chats);
     }
 
-    // Supabase — silencieux si table absente
     await safeDelete('matches', { mode: 'ai' });
   },
 
   async getActiveByPlayer(playerId: string): Promise<MatchData[]> {
     const matches = ls<MatchData[]>(LS.matches, []);
     return matches.filter(m =>
-      (m.player1Id === playerId || m.player2Id === playerId) && m.status === 'active'
+      (m.player1Id === playerId || m.player2Id === playerId) &&
+      m.status === 'active'
     );
   },
-};
 
+  // ✅ AJOUT IMPORTANT — REALTIME MATCH SUBSCRIPTION
+  async subscribeToMatch(matchId: string, callback: (match: MatchData) => void) {
+    const channel = supabase
+      .channel(`match:${matchId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'matches',
+          filter: `id=eq.${matchId}`,
+        },
+        (payload) => {
+          const r = payload.new as any;
+
+          callback({
+            id: r.id,
+            player1Id: r.player1_id,
+            player2Id: r.player2_id,
+            mode: r.mode,
+            status: r.status,
+            winnerId: r.winner_id,
+            betAmount: r.bet_amount,
+            currency: r.currency,
+            boardSize: r.board_size,
+            pieceCount: r.piece_count,
+            timePerTurn: r.time_per_turn,
+            consecutiveDraws: r.consecutive_draws,
+            boardState: r.board_state,
+            createdAt: r.created_at,
+            finishedAt: r.finished_at,
+          });
+        }
+      )
+      .subscribe();
+
+    return channel;
+  },
+
+};
 // ═══════════════════════════════════════════════════════════════════════════════
 //  TRANSACTION OPERATIONS
 // ═══════════════════════════════════════════════════════════════════════════════
