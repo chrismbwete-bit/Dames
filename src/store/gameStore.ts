@@ -171,70 +171,47 @@ interface AppStore {
     defaultCurrency: Currency;
   };
 
-  // Auth
+  // Auth & Navigation
   setAuthMode: (mode: 'login' | 'register' | 'forgot') => void;
   login: (email: string, password: string) => Promise<boolean>;
   register: (data: Partial<Player> & { password: string }) => Promise<RegisterError>;
   logout: () => void;
   forgotPassword: (email: string) => Promise<boolean>;
-  // Wallet virtuel
-  useVirtualBalance: (amount: number, currency: Currency) => Promise<boolean>;
-  hasEnoughFunds: (amount: number, currency: Currency, useVirtual?: boolean) => boolean;
-
-  // Navigation
   setCurrentView: (view: AppView) => void;
   handleLogoClick: () => void;
 
-  // Game
-initGame: (mode: GameMode, options?: Partial<GameState> & { aiDiff?: AIDifficulty; useVirtual?: boolean }) => void;
-selectPiece: (piece: Piece) => void;
-makeMove: (move: Move) => void;
-syncFromServer: (matchData: any) => void;
-aiMove: () => void;
-
-  set({
-    gameState: {
-      ...gameState,
-      pieces: matchData.pieces,
-      currentTurn: matchData.currentTurn,
-      gameOver: matchData.gameOver,
-      winner: matchData.winner,
-      moveHistory: matchData.moveHistory || [],
-    },
-  });
-},
-  aiMove: () => void;
-  syncFromServer: (matchData: any) => void;
-
-  // Chat
-  addChatMessage: (content: string) => void;
-  pollChatMessages: () => Promise<void>;
-  toggleChat: () => void;
-
-  // Notifications
-  addNotification: (notif: Omit<Notification, 'id' | 'timestamp' | 'read'>) => void;
-  markNotificationsRead: () => void;
-  loadNotifications: () => Promise<void>;
-
   // Wallet
+  useVirtualBalance: (amount: number, currency: Currency) => Promise<boolean>;
+  hasEnoughFunds: (amount: number, currency: Currency, useVirtual?: boolean) => boolean;
   deposit: (amount: number, method: string, currency: Currency) => Promise<void>;
   withdraw: (amount: number, method: string, currency: Currency) => Promise<void>;
   updateBalance: (amount: number, type: Transaction['type'], description: string, currency?: Currency) => Promise<void>;
   loadTransactions: () => Promise<void>;
 
-  // Challenges
-  sendChallenge: (toPlayer: OnlinePlayer, betAmount: number, currency: Currency, pieceCount: number, boardSize: number, timePerTurn: number, useVirtual?: boolean, playerPieceColor?: string, opponentPieceColor?: string, is3D?: boolean) => Promise<void>;
-  acceptChallenge: (challengeId: string) => Promise<void>;
-  declineChallenge: (challengeId: string) => Promise<void>;
-  loadChallenges: () => Promise<void>;
+  // Game
+  initGame: (mode: GameMode, options?: any) => void;
+  selectPiece: (piece: Piece) => void;
+  makeMove: (move: Move) => Promise<void>;
+  aiMove: () => void;
+  syncFromServer: (matchData: any) => void;
+  abandonGame: () => void;
 
-  // Players
+  // Chat & Social
+  addChatMessage: (content: string) => void;
+  pollChatMessages: () => Promise<void>;
+  toggleChat: () => void;
+  addNotification: (notif: Omit<Notification, 'id' | 'timestamp' | 'read'>) => void;
+  loadNotifications: () => Promise<void>;
+  loadChallenges: () => Promise<void>;
   loadOnlinePlayers: () => Promise<void>;
   loadLeaderboard: () => Promise<void>;
 
-  // Admin
+  // Admin & Utils
   updateAdminSettings: (settings: Partial<AppStore['adminSettings']>) => Promise<void>;
   loadAdminSettings: () => Promise<void>;
+  initDB: () => Promise<void>;
+  decrementTimer: () => void;
+}
 
   // Game
   abandonGame: () => void;
@@ -802,189 +779,86 @@ virtualBalanceUSD:
     }
   },
 
-  selectPiece: (piece) => {
-  const { gameState, currentUser } = get();
-  if (!gameState || gameState.gameOver) return;
+ selectPiece: (piece) => {
+    const { gameState } = get();
+    if (!gameState || gameState.gameOver) return;
 
-  // 🔐 Bloquer si ce n’est pas le tour du joueur
-  if (gameState.currentTurn !== gameState.playerColor) return;
-
-  if (piece.color !== gameState.currentTurn) return;
-
-    // ── Restriction en ligne / défi : chaque joueur ne contrôle QUE ses pions ──
-    // En mode 'ai' : seul le joueur humain joue (playerColor)
-    // En mode 'online'/'challenge' : chaque joueur contrôle uniquement sa couleur (playerColor)
-    if (gameState.mode === 'ai') {
-      // Bloquer si ce n'est pas le tour du joueur humain
-      if (gameState.currentTurn !== gameState.playerColor) return;
-    } else {
-      // En ligne/défi : vérifier que le joueur courant contrôle bien ce pion
-      // Le joueur qui a créé la session contrôle playerColor
-      // On identifie le joueur par currentUser
-      if (!currentUser) return;
-      // Seuls les pions de la couleur assignée au joueur courant sont jouables
-      if (piece.color !== gameState.playerColor) return;
-      // Bloquer si ce n'est pas le tour du joueur
-      if (gameState.currentTurn !== gameState.playerColor) return;
-    }
+    // Vérifier si c'est le tour du joueur (Rouge ou Noir)
+    if (piece.color !== gameState.currentTurn) return;
+    
+    // En ligne ou défi : on ne peut toucher que sa propre couleur
+    if (gameState.mode !== 'ai' && piece.color !== gameState.playerColor) return;
 
     const mandatory = hasMandatoryCapture(gameState.pieces, piece.color, gameState.boardSize);
-    let validMoves = getValidMoves(piece, gameState.pieces, gameState.boardSize);
-    if (mandatory) validMoves = validMoves.filter(m => m.capturedPieces && m.capturedPieces.length > 0);
-    set({ gameState: { ...gameState, selectedPiece: piece, validMoves } });
+    let moves = getValidMoves(piece, gameState.pieces, gameState.boardSize);
+    
+    // Règle africaine : si on peut manger, on DOIT manger
+    if (mandatory) {
+      moves = moves.filter(m => m.capturedPieces && m.capturedPieces.length > 0);
+    }
+
+    set({ gameState: { ...gameState, selectedPiece: piece, validMoves: moves } });
+  },
 
   makeMove: async (move: Move) => {
-  const { gameState, currentUser } = get();
-  if (!gameState || gameState.gameOver) return;
+    const { gameState } = get();
+    if (!gameState || gameState.gameOver) return;
 
-  // 🔐 Sécurité 1 — Vérifier que c’est le tour du joueur
-  if (gameState.mode !== 'ai') {
-    if (!currentUser) return;
+    let newPieces = [...gameState.pieces];
+    const pieceIdx = newPieces.findIndex(p => p.row === move.fromRow && p.col === move.fromCol);
+    if (pieceIdx === -1) return;
 
-    const isPlayerTurn =
-      (gameState.currentTurn === 'red' && gameState.playerColor === 'red') ||
-      (gameState.currentTurn === 'black' && gameState.playerColor === 'black');
+    const movingPiece = { ...newPieces[pieceIdx], row: move.toRow, col: move.toCol };
 
-    if (!isPlayerTurn) return;
-  }
-
-  let newPieces = [...gameState.pieces];
-
-  const pieceIdx = newPieces.findIndex(
-    p => p.row === move.fromRow && p.col === move.fromCol
-  );
-
-  if (pieceIdx === -1) return;
-
-  const movingPiece = { ...newPieces[pieceIdx] };
-  movingPiece.row = move.toRow;
-  movingPiece.col = move.toCol;
-
-  // 🎯 Captures
-  let capR = gameState.capturedRed;
-  let capB = gameState.capturedBlack;
-
-  if (move.capturedPieces?.length) {
-    for (const cap of move.capturedPieces) {
-      const victim = newPieces.find(
-        p => p.row === cap.row && p.col === cap.col
-      );
-      if (!victim) continue;
-
-      if (victim.color === 'red') capR++;
-      else capB++;
-
-      newPieces = newPieces.filter(
-        p => !(p.row === cap.row && p.col === cap.col)
-      );
+    // 1. Gérer les captures (retrait des pions mangés)
+    let capR = gameState.capturedRed;
+    let capB = gameState.capturedBlack;
+    if (move.capturedPieces) {
+      move.capturedPieces.forEach(cap => {
+        const victim = newPieces.find(p => p.row === cap.row && p.col === cap.col);
+        if (victim?.color === 'red') capR++; else capB++;
+        newPieces = newPieces.filter(p => !(p.row === cap.row && p.col === cap.col));
+      });
     }
-  }
 
-  // 👑 Promotion
-  if (!movingPiece.isKing) {
-    if (movingPiece.color === 'red' && movingPiece.row === gameState.boardSize - 1)
-      movingPiece.isKing = true;
+    // 2. Promotion en Roi (Dame)
+    if (!movingPiece.isKing) {
+      if (movingPiece.color === 'red' && movingPiece.row === gameState.boardSize - 1) movingPiece.isKing = true;
+      if (movingPiece.color === 'black' && movingPiece.row === 0) movingPiece.isKing = true;
+    }
 
-    if (movingPiece.color === 'black' && movingPiece.row === 0)
-      movingPiece.isKing = true;
-  }
+    // Mettre à jour la liste des pièces
+    newPieces = newPieces.map(p => p.id === movingPiece.id ? movingPiece : p);
 
-  newPieces = newPieces.map(p =>
-    p.id === movingPiece.id ? movingPiece : p
-  );
+    // 3. Changement de tour et vérification victoire
+    const nextTurn = gameState.currentTurn === 'red' ? 'black' : 'red';
+    const gameStatus = checkGameOver(newPieces, nextTurn, gameState.boardSize, gameState.consecutiveDraws);
 
-  const nextTurn = gameState.currentTurn === 'red' ? 'black' : 'red';
-
-  // 🏁 Vérification victoire
-  const redRemain = newPieces.filter(p => p.color === 'red').length;
-  const blackRemain = newPieces.filter(p => p.color === 'black').length;
-
-  let winner: PieceColor | 'draw' | null = null;
-  let isOver = false;
-
-  if (redRemain === 0) {
-    winner = 'black';
-    isOver = true;
-  } else if (blackRemain === 0) {
-    winner = 'red';
-    isOver = true;
-  }
-
-  const updatedGameState = {
-    ...gameState,
-    pieces: newPieces,
-    currentTurn: nextTurn,
-    selectedPiece: null,
-    validMoves: [],
-    capturedRed: capR,
-    capturedBlack: capB,
-    gameOver: isOver,
-    winner,
-    moveHistory: [...gameState.moveHistory, move],
-  };
-
-  set({ gameState: updatedGameState });
-
-  // 🌍 SYNCHRONISATION ONLINE
-  if (
-    (gameState.mode === 'online' || gameState.mode === 'challenge') &&
-    gameState.matchId
-  ) {
-    try {
-      await MatchService.update(gameState.matchId, {
+    set({
+      gameState: {
+        ...gameState,
         pieces: newPieces,
         currentTurn: nextTurn,
-        gameOver: isOver,
-        winner,
-        moveHistory: updatedGameState.moveHistory,
-      });
-    } catch (err) {
-      console.error('Erreur sync serveur:', err);
+        selectedPiece: null,
+        validMoves: [],
+        capturedRed: capR,
+        capturedBlack: capB,
+        gameOver: gameStatus.over,
+        winner: gameStatus.winner
+      }
+    });
+
+    // 4. Déclencher l'IA si c'est son tour
+    if (!gameStatus.over && gameState.mode === 'ai' && nextTurn !== gameState.playerColor) {
+      setTimeout(() => get().aiMove(), 600);
     }
-  }
+  },
 
-  // 🤖 IA
-  if (!isOver && gameState.mode === 'ai' && nextTurn !== gameState.playerColor) {
-    setTimeout(() => {
-      get().aiMove();
-    }, 600);
-  }
-},
-syncFromServer: (matchData: any) => {
-  const { gameState } = get();
-  if (!gameState) return;
-
-  // 🔐 Vérifier que c'est le bon match
-  if (matchData.id !== gameState.matchId) return;
-
-  // 🔐 Si déjà terminé localement, ignorer
-  if (gameState.gameOver) return;
-
-  // 🔐 Empêcher écrasement si on a déjà ce move
-  if (
-    matchData.moveHistory &&
-    matchData.moveHistory.length <= gameState.moveHistory.length
-  ) {
-    return;
-  }
-
-  set({
-    gameState: {
-      ...gameState,
-      pieces: matchData.pieces,
-      currentTurn: matchData.currentTurn,
-      gameOver: matchData.gameOver,
-      winner: matchData.winner,
-      moveHistory: matchData.moveHistory || [],
-    },
-  });
-},
   aiMove: () => {
     const { gameState } = get();
-    if (!gameState) return;
-    const aiColor: PieceColor = gameState.playerColor === 'red' ? 'black' : 'red';
-    const mv = getAIMove(gameState.pieces, aiColor, gameState.boardSize, gameState.aiDifficulty, gameState.consecutiveDraws);
-    if (mv) get().makeMove(mv);
+    if (!gameState || gameState.gameOver) return;
+    const move = getAIMove(gameState.pieces, gameState.currentTurn, gameState.boardSize, gameState.aiDifficulty, gameState.consecutiveDraws);
+    if (move) get().makeMove(move);
   },
 
   // ── Chat ──────────────────────────────────────────────────────────────────
