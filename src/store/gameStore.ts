@@ -186,10 +186,25 @@ interface AppStore {
   handleLogoClick: () => void;
 
   // Game
-  initGame: (mode: GameMode, options?: Partial<GameState> & { aiDiff?: AIDifficulty; useVirtual?: boolean }) => void;
-  selectPiece: (piece: Piece) => void;
-  makeMove: (move: Move) => void;
+initGame: (mode: GameMode, options?: Partial<GameState> & { aiDiff?: AIDifficulty; useVirtual?: boolean }) => void;
+selectPiece: (piece: Piece) => void;
+makeMove: (move: Move) => void;
+syncFromServer: (matchData: any) => void;
+aiMove: () => void;
+
+  set({
+    gameState: {
+      ...gameState,
+      pieces: matchData.pieces,
+      currentTurn: matchData.currentTurn,
+      gameOver: matchData.gameOver,
+      winner: matchData.winner,
+      moveHistory: matchData.moveHistory || [],
+    },
+  });
+},
   aiMove: () => void;
+  syncFromServer: (matchData: any) => void;
 
   // Chat
   addChatMessage: (content: string) => void;
@@ -652,8 +667,15 @@ export const useGameStore = create<AppStore>((set, get) => ({
 
     const updatedUser: Player = {
       ...currentUser,
-      virtualBalanceCDF: currentUser.virtualBalanceCDF - (currency === 'CDF' ? amtCDF : amtCDF),
-      virtualBalanceUSD: currentUser.virtualBalanceUSD - (currency === 'USD' ? amtUSD : amtUSD),
+      virtualBalanceCDF:
+  currency === 'CDF'
+    ? currentUser.virtualBalanceCDF - amtCDF
+    : currentUser.virtualBalanceCDF,
+
+virtualBalanceUSD:
+  currency === 'USD'
+    ? currentUser.virtualBalanceUSD - amtUSD
+    : currentUser.virtualBalanceUSD,
     };
     set({ currentUser: updatedUser });
     await PlayerService.update(currentUser.id, {
@@ -781,9 +803,13 @@ export const useGameStore = create<AppStore>((set, get) => ({
   },
 
   selectPiece: (piece) => {
-    const { gameState, currentUser } = get();
-    if (!gameState || gameState.gameOver) return;
-    if (piece.color !== gameState.currentTurn) return;
+  const { gameState, currentUser } = get();
+  if (!gameState || gameState.gameOver) return;
+
+  // 🔐 Bloquer si ce n’est pas le tour du joueur
+  if (gameState.currentTurn !== gameState.playerColor) return;
+
+  if (piece.color !== gameState.currentTurn) return;
 
     // ── Restriction en ligne / défi : chaque joueur ne contrôle QUE ses pions ──
     // En mode 'ai' : seul le joueur humain joue (playerColor)
@@ -806,171 +832,153 @@ export const useGameStore = create<AppStore>((set, get) => ({
     let validMoves = getValidMoves(piece, gameState.pieces, gameState.boardSize);
     if (mandatory) validMoves = validMoves.filter(m => m.capturedPieces && m.capturedPieces.length > 0);
     set({ gameState: { ...gameState, selectedPiece: piece, validMoves } });
-  },
 
-  makeMove: (move) => {
-    const { gameState, adminSettings, currentUser } = get();
-    if (!gameState || gameState.gameOver) return;
+  makeMove: async (move: Move) => {
+  const { gameState, currentUser } = get();
+  if (!gameState || gameState.gameOver) return;
 
-    let newPieces = gameState.pieces.map(p => ({ ...p }));
-    if (move.capturedPieces) {
-      newPieces = newPieces.filter(p => !move.capturedPieces!.find(c => c.row === p.row && c.col === p.col));
+  // 🔐 Sécurité 1 — Vérifier que c’est le tour du joueur
+  if (gameState.mode !== 'ai') {
+    if (!currentUser) return;
+
+    const isPlayerTurn =
+      (gameState.currentTurn === 'red' && gameState.playerColor === 'red') ||
+      (gameState.currentTurn === 'black' && gameState.playerColor === 'black');
+
+    if (!isPlayerTurn) return;
+  }
+
+  let newPieces = [...gameState.pieces];
+
+  const pieceIdx = newPieces.findIndex(
+    p => p.row === move.fromRow && p.col === move.fromCol
+  );
+
+  if (pieceIdx === -1) return;
+
+  const movingPiece = { ...newPieces[pieceIdx] };
+  movingPiece.row = move.toRow;
+  movingPiece.col = move.toCol;
+
+  // 🎯 Captures
+  let capR = gameState.capturedRed;
+  let capB = gameState.capturedBlack;
+
+  if (move.capturedPieces?.length) {
+    for (const cap of move.capturedPieces) {
+      const victim = newPieces.find(
+        p => p.row === cap.row && p.col === cap.col
+      );
+      if (!victim) continue;
+
+      if (victim.color === 'red') capR++;
+      else capB++;
+
+      newPieces = newPieces.filter(
+        p => !(p.row === cap.row && p.col === cap.col)
+      );
     }
-    const mp = newPieces.find(p => p.row === move.fromRow && p.col === move.fromCol);
-    if (!mp) return;
-    mp.row = move.toRow; mp.col = move.toCol;
-    if (mp.color === 'red' && mp.row === gameState.boardSize-1) mp.isKing = true;
-    if (mp.color === 'black' && mp.row === 0) mp.isKing = true;
+  }
 
-    const capturedRed = gameState.capturedRed + (move.capturedPieces?.filter(c => {
-      const p = gameState.pieces.find(pp => pp.row === c.row && pp.col === c.col);
-      return p?.color === 'red';
-    }).length || 0);
-    const capturedBlack = gameState.capturedBlack + (move.capturedPieces?.filter(c => {
-      const p = gameState.pieces.find(pp => pp.row === c.row && pp.col === c.col);
-      return p?.color === 'black';
-    }).length || 0);
+  // 👑 Promotion
+  if (!movingPiece.isKing) {
+    if (movingPiece.color === 'red' && movingPiece.row === gameState.boardSize - 1)
+      movingPiece.isKing = true;
 
-    const nextTurn: PieceColor = gameState.currentTurn === 'red' ? 'black' : 'red';
-    const { over, winner } = checkGameOver(newPieces, nextTurn, gameState.boardSize, gameState.consecutiveDraws);
+    if (movingPiece.color === 'black' && movingPiece.row === 0)
+      movingPiece.isKing = true;
+  }
 
-    if (over && currentUser) {
-      if (gameState.mode === 'ai') {
-        // ══════════════════════════════════════════════════════════════
-        // MATCH IA : SUPPRESSION IMMÉDIATE — aucune trace conservée
-        // ══════════════════════════════════════════════════════════════
-        // Supprime tout historique local de ce match IA
-        MatchService.deleteFinished(gameState.matchId);
-        ChatService.deleteByMatch(gameState.matchId);
-        // Notification simple sans persistance DB
-        if (winner === gameState.playerColor) {
-          get().addNotification({ type: 'win', title: 'Victoire vs IA! 🏆', message: `Vous avez battu l'IA (${gameState.aiDifficulty}) — Partie gratuite` });
-        } else if (winner && winner !== 'draw') {
-          get().addNotification({ type: 'loss', title: 'Défaite vs IA', message: `L'IA (${gameState.aiDifficulty}) vous a battu — Réessayez!` });
-        } else {
-          get().addNotification({ type: 'system', title: 'Match nul vs IA 🤝', message: 'Égalité parfaite contre l\'IA!' });
-        }
-      } else if (gameState.betAmount > 0) {
-        // ══════════════════════════════════════════════════════════════
-        // MATCH EN LIGNE / DÉFI : calcul gains + suppression historique
-        // ══════════════════════════════════════════════════════════════
-        const feeRate = adminSettings.platformFee / 100;
-        const feePerPlayer = gameState.betAmount * feeRate;
-        const totalFees = feePerPlayer * 2;
-        const prize = gameState.betAmount * 2 - totalFees;
-        // Détecter si la partie utilisait le wallet virtuel
-        // (la mise a déjà été déduite dans initGame — on restitue ici les gains)
-        const isVirtual = (currentUser?.virtualBalanceCDF ?? 0) > 0 &&
-                          (currentUser?.balance ?? 0) < gameState.betAmount;
+  newPieces = newPieces.map(p =>
+    p.id === movingPiece.id ? movingPiece : p
+  );
 
-        if (winner === gameState.playerColor) {
-          if (isVirtual) {
-            // Gain virtuel — crédité sur le wallet virtuel
-            const updatedUser = {
-              ...currentUser!,
-              virtualBalanceCDF: (currentUser?.virtualBalanceCDF ?? 0) + prize,
-              totalWins: (currentUser?.totalWins ?? 0) + 1,
-            };
-            set({ currentUser: updatedUser });
-            PlayerService.update(currentUser!.id, {
-              virtualBalanceCDF: updatedUser.virtualBalanceCDF,
-              totalWins: updatedUser.totalWins,
-            });
-            get().addNotification({
-              type: 'win', title: '🏆 Victoire! (Virtuel)',
-              message: `Vous avez gagné ${prize.toLocaleString()} ${gameState.currency} virtuels!`,
-              amount: prize,
-            });
-          } else {
-            get().updateBalance(prize, 'win', `Gain match — ${prize.toLocaleString()} ${gameState.currency}`, gameState.currency);
-            get().addNotification({
-              type: 'win', title: '🏆 Victoire!',
-              message: `Vous avez gagné ${prize.toLocaleString()} ${gameState.currency}!`,
-              amount: prize,
-            });
-            // ✅ Commission admin — UNIQUEMENT pour les matchs réels (non virtuels)
-            if (totalFees > 0) {
-              AdminWalletService.collectFee(totalFees, gameState.currency, gameState.matchId);
-            }
-          }
-        } else if (winner && winner !== 'draw') {
-          if (isVirtual) {
-            const updatedUser = {
-              ...currentUser!,
-              totalLosses: (currentUser?.totalLosses ?? 0) + 1,
-            };
-            set({ currentUser: updatedUser });
-            PlayerService.update(currentUser!.id, { totalLosses: updatedUser.totalLosses });
-            get().addNotification({
-              type: 'loss', title: 'Défaite (Virtuel)',
-              message: `Vous avez perdu ${gameState.betAmount.toLocaleString()} ${gameState.currency} virtuels`,
-              amount: gameState.betAmount,
-            });
-          } else {
-            get().updateBalance(-gameState.betAmount, 'loss', `Perte match — ${gameState.betAmount.toLocaleString()} ${gameState.currency}`, gameState.currency);
-            get().addNotification({
-              type: 'loss', title: 'Défaite',
-              message: `Vous avez perdu ${gameState.betAmount.toLocaleString()} ${gameState.currency}`,
-              amount: gameState.betAmount,
-            });
-            // Commission admin sur défaite (match réel)
-            if (totalFees > 0) {
-              AdminWalletService.collectFee(totalFees, gameState.currency, gameState.matchId);
-            }
-          }
-        }
+  const nextTurn = gameState.currentTurn === 'red' ? 'black' : 'red';
 
-        // Suppression de l'historique du match en ligne après fin
-        MatchService.deleteFinished(gameState.matchId);
-        ChatService.deleteByMatch(gameState.matchId);
-      }
-    }
+  // 🏁 Vérification victoire
+  const redRemain = newPieces.filter(p => p.color === 'red').length;
+  const blackRemain = newPieces.filter(p => p.color === 'black').length;
 
-    const newConsecDraws = winner === 'draw' ? gameState.consecutiveDraws + 1 : 0;
+  let winner: PieceColor | 'draw' | null = null;
+  let isOver = false;
 
-    set({
-      gameState: {
-        ...gameState,
+  if (redRemain === 0) {
+    winner = 'black';
+    isOver = true;
+  } else if (blackRemain === 0) {
+    winner = 'red';
+    isOver = true;
+  }
+
+  const updatedGameState = {
+    ...gameState,
+    pieces: newPieces,
+    currentTurn: nextTurn,
+    selectedPiece: null,
+    validMoves: [],
+    capturedRed: capR,
+    capturedBlack: capB,
+    gameOver: isOver,
+    winner,
+    moveHistory: [...gameState.moveHistory, move],
+  };
+
+  set({ gameState: updatedGameState });
+
+  // 🌍 SYNCHRONISATION ONLINE
+  if (
+    (gameState.mode === 'online' || gameState.mode === 'challenge') &&
+    gameState.matchId
+  ) {
+    try {
+      await MatchService.update(gameState.matchId, {
         pieces: newPieces,
         currentTurn: nextTurn,
-        selectedPiece: null,
-        validMoves: [],
-        gameOver: over,
+        gameOver: isOver,
         winner,
-        capturedRed,
-        capturedBlack,
-        playerTimeLeft: gameState.timePerTurn,
-        moveHistory: [...gameState.moveHistory, move],
-        consecutiveDraws: newConsecDraws,
-      },
-    });
-
-    if (!over && gameState.mode === 'ai' && nextTurn !== gameState.playerColor) {
-      const delay = { simple:300, easy:500, normal:700, hard:950, extreme:1300 }[gameState.aiDifficulty] || 700;
-      setTimeout(() => {
-        const st = get().gameState;
-        if (!st || st.gameOver) return;
-        const aiColor: PieceColor = st.playerColor === 'red' ? 'black' : 'red';
-        const aiMv = getAIMove(st.pieces, aiColor, st.boardSize, st.aiDifficulty, st.consecutiveDraws);
-        if (aiMv) get().makeMove(aiMv);
-      }, delay + Math.random() * 300);
+        moveHistory: updatedGameState.moveHistory,
+      });
+    } catch (err) {
+      console.error('Erreur sync serveur:', err);
     }
+  }
 
-    // ── En ligne/défi : simuler le coup de l'adversaire après un délai ──
-    // (En production réelle, ce coup viendrait via Supabase Realtime de l'autre client)
-    if (!over && (gameState.mode === 'online' || gameState.mode === 'challenge') && nextTurn !== gameState.playerColor) {
-      const opponentColor: PieceColor = gameState.playerColor === 'red' ? 'black' : 'red';
-      const delay = 1200 + Math.random() * 1500; // délai humain simulé
-      setTimeout(() => {
-        const st = get().gameState;
-        if (!st || st.gameOver || st.currentTurn !== opponentColor) return;
-        // Simule le coup adverse (IA niveau normal pour l'adversaire en ligne)
-        const oppMv = getAIMove(st.pieces, opponentColor, st.boardSize, 'normal', st.consecutiveDraws);
-        if (oppMv) get().makeMove(oppMv);
-      }, delay);
-    }
-  },
+  // 🤖 IA
+  if (!isOver && gameState.mode === 'ai' && nextTurn !== gameState.playerColor) {
+    setTimeout(() => {
+      get().aiMove();
+    }, 600);
+  }
+},
+syncFromServer: (matchData: any) => {
+  const { gameState } = get();
+  if (!gameState) return;
 
+  // 🔐 Vérifier que c'est le bon match
+  if (matchData.id !== gameState.matchId) return;
+
+  // 🔐 Si déjà terminé localement, ignorer
+  if (gameState.gameOver) return;
+
+  // 🔐 Empêcher écrasement si on a déjà ce move
+  if (
+    matchData.moveHistory &&
+    matchData.moveHistory.length <= gameState.moveHistory.length
+  ) {
+    return;
+  }
+
+  set({
+    gameState: {
+      ...gameState,
+      pieces: matchData.pieces,
+      currentTurn: matchData.currentTurn,
+      gameOver: matchData.gameOver,
+      winner: matchData.winner,
+      moveHistory: matchData.moveHistory || [],
+    },
+  });
+},
   aiMove: () => {
     const { gameState } = get();
     if (!gameState) return;
